@@ -214,7 +214,6 @@ class ConfigComboBox(QComboBox):
         for widget in (self.view(), self.view().viewport()):
             widget.setAutoFillBackground(True)
             widget.setAttribute(Qt.WA_StyledBackground, True)
-            widget.setAttribute(Qt.WA_OpaquePaintEvent, True)
             palette = widget.palette()
             palette.setColor(QPalette.Base, self._POPUP_COLOR)
             palette.setColor(QPalette.Window, self._POPUP_COLOR)
@@ -863,6 +862,14 @@ class ConfigTab(QWidget):
         ])
         add_row(trans_section, "Source Language:", size_field(self.source_language_combo))
 
+        self.reasoning_combo = ConfigComboBox()
+        self.reasoning_combo.addItems(["Off", "Low", "High"])
+        self.reasoning_combo.setToolTip(
+            "DeepSeek thinking mode (official API only). Off is fastest and "
+            "cheapest; Low/High add reasoning tokens, billed as output."
+        )
+        add_row(trans_section, "DeepSeek Reasoning:", size_field(self.reasoning_combo))
+
         self.timeout_spin = QSpinBox()
         self.timeout_spin.setButtonSymbols(QSpinBox.NoButtons)
         self.timeout_spin.setRange(30, 300)
@@ -930,12 +937,19 @@ class ConfigTab(QWidget):
         self.file_threads_spin.setButtonSymbols(QSpinBox.NoButtons)
         self.file_threads_spin.setRange(1, 10)
         self.file_threads_spin.setValue(1)
+        self.file_threads_spin.setToolTip(
+            "How many files are translated at the same time (separate workers)."
+        )
         add_row(perf_section, "File Threads:", size_field(self.file_threads_spin))
 
         self.threads_spin = QSpinBox()
         self.threads_spin.setButtonSymbols(QSpinBox.NoButtons)
         self.threads_spin.setRange(1, 20)
         self.threads_spin.setValue(1)
+        self.threads_spin.setToolTip(
+            "How many batches of one file are sent as parallel requests.\n"
+            "1 = sequential. File Threads controls parallel files."
+        )
         add_row(perf_section, "Threads per File:", size_field(self.threads_spin))
 
         self.batch_size_spin = QSpinBox()
@@ -1382,6 +1396,7 @@ class ConfigTab(QWidget):
         # Translation settings
         self.language_combo.setCurrentText(_get("language", "English"))
         self.source_language_combo.setCurrentText(_get("source_language", "Japanese"))
+        self.reasoning_combo.setCurrentText(str(_get("deepseekReasoning", "off")).strip().capitalize())
         self.timeout_spin.setValue(int(_get("timeout", "90")))
 
         # Performance settings
@@ -1452,6 +1467,7 @@ class ConfigTab(QWidget):
         self.model_combo.currentTextChanged.connect(self.auto_save)
         self.language_combo.currentTextChanged.connect(self.auto_save)
         self.source_language_combo.currentTextChanged.connect(self.auto_save)
+        self.reasoning_combo.currentTextChanged.connect(self.auto_save)
         
         # Spin boxes — use editingFinished so saves trigger on Enter or focus-out,
         # not on every intermediate keystroke while typing.
@@ -1483,6 +1499,7 @@ class ConfigTab(QWidget):
             self.model_combo.currentTextChanged.disconnect(self.auto_save)
             self.language_combo.currentTextChanged.disconnect(self.auto_save)
             self.source_language_combo.currentTextChanged.disconnect(self.auto_save)
+            self.reasoning_combo.currentTextChanged.disconnect(self.auto_save)
             self.timeout_spin.editingFinished.disconnect(self.auto_save)
             self.file_threads_spin.editingFinished.disconnect(self.auto_save)
             self.threads_spin.editingFinished.disconnect(self.auto_save)
@@ -1545,6 +1562,7 @@ class ConfigTab(QWidget):
                 "model": self.model_combo.currentText(),
                 "language": self.language_combo.currentText(),
                 "source_language": self.source_language_combo.currentText(),
+                "deepseekReasoning": self.reasoning_combo.currentText().lower(),
                 "timeout": str(self.timeout_spin.value()),
                 "fileThreads": str(self.file_threads_spin.value()),
                 "threads": str(self.threads_spin.value()),
@@ -1608,6 +1626,7 @@ class ConfigTab(QWidget):
         # Translation settings
         self.language_combo.setCurrentText("English")
         self.source_language_combo.setCurrentText("Japanese")
+        self.reasoning_combo.setCurrentText("Off")
         self.timeout_spin.setValue(90)
         
         # Performance settings
@@ -1661,6 +1680,7 @@ class ConfigTab(QWidget):
             "model": self.model_combo.currentText(),
             "language": self.language_combo.currentText(),
             "source_language": self.source_language_combo.currentText(),
+            "deepseekReasoning": self.reasoning_combo.currentText().lower(),
             "timeout": self.timeout_spin.value(),
             "fileThreads": self.file_threads_spin.value(),
             "threads": self.threads_spin.value(),
@@ -1697,7 +1717,7 @@ class ConfigTab(QWidget):
             errors.append("Timeout should be at least 30 seconds")
             
         if self.threads_spin.value() > 10 and "gpt-4" in self.model_combo.currentText().lower():
-            errors.append("Too many threads for GPT-4 - recommended: 1-2")
+            errors.append("Too many threads per file for GPT-4 - recommended: 1-2")
             
         if errors:
             QMessageBox.warning(self, "Validation Errors", "\n".join(errors))

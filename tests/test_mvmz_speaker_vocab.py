@@ -184,6 +184,13 @@ class MVMZSpeakerVocabTests(unittest.TestCase):
             mvmz._replace_speaker_in_param(r"\v[007]\AA[N]", r"\v[007]", r"\v[007]"),
             r"\v[007]\AA[N]",
         )
+        # Bracketed name boxes (name inside 【】) must keep their colour codes.
+        self.assertEqual(
+            mvmz._replace_speaker_in_param(
+                "\u3010\\C[14]Mika\\C[0]\u3011", "Mika", "Мика"
+            ),
+            "\u3010\\C[14]Мика\\C[0]\u3011",
+        )
 
     def test_var_speaker_resolves_from_actor_name_script(self):
         """\\v[N] mirrors Actors.json when code 122 assigns actor(N).name()."""

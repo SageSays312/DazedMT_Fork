@@ -148,6 +148,18 @@ class CacheKeyTests(CacheTestBase):
         self.assertEqual(glossary + sfx, "")
 
 
+    def test_live_profile_separates_model_prompt_and_reasoning(self):
+        """A changed setup must not reuse results made under the previous one."""
+        with mock.patch.dict(os.environ, {"deepseekReasoning": "off"}):
+            base = T._live_cache_profile("deepseek-flash", "prompt A")
+            self.assertEqual(base, T._live_cache_profile("deepseek-flash", "prompt A"))
+            self.assertNotEqual(base, T._live_cache_profile("deepseek-v4-pro", "prompt A"))
+            self.assertNotEqual(base, T._live_cache_profile("deepseek-flash", "prompt B"))
+            self.assertNotEqual(base, T._live_cache_profile("deepseek-flash", "prompt A", True))
+        with mock.patch.dict(os.environ, {"deepseekReasoning": "high"}):
+            self.assertNotEqual(base, T._live_cache_profile("deepseek-flash", "prompt A"))
+
+
 class CacheRoundTripTests(CacheTestBase):
     def test_cached_value_shapes_are_preserved(self):
         cases = (

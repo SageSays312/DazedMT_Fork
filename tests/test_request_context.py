@@ -590,5 +590,89 @@ class RequestContextSerializationTests(unittest.TestCase):
         ))
 
 
+class DeepSeekReasoningTests(unittest.TestCase):
+    """Thinking is DeepSeek's default and is billed as output, so it is opt-in."""
+
+    OFFICIAL = "https://api.deepseek.com/v1/"
+
+    def _params(self, mode, endpoint):
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop("deepseekReasoning", None)
+            if mode is not None:
+                os.environ["deepseekReasoning"] = mode
+            return T.buildOpenAIRequest(
+                "Translate.", '{"Line1":"x"}', [], 0.0, "json", "deepseek-flash", 1,
+                api_provider="openai", api_url=endpoint,
+            )
+
+    def test_reasoning_defaults_to_off_and_low_high_opt_in(self):
+        for mode in (None, "off", "bogus"):
+            with self.subTest(mode=mode):
+                params = self._params(mode, self.OFFICIAL)
+                self.assertEqual(params["extra_body"], {"thinking": {"type": "disabled"}})
+                self.assertNotIn("reasoning_effort", params)
+        for mode in ("low", "high"):
+            with self.subTest(mode=mode):
+                params = self._params(mode, self.OFFICIAL)
+                self.assertEqual(params["extra_body"], {"thinking": {"type": "enabled"}})
+                self.assertEqual(params["reasoning_effort"], mode)
+                self.assertGreaterEqual(params["max_tokens"], T.MAX_TRANSLATION_OUTPUT_TOKENS)
+
+    def test_thinking_field_is_not_sent_to_other_gateways(self):
+        params = self._params("high", "https://openrouter.ai/api/v1")
+        self.assertNotIn("extra_body", params)
+        self.assertNotIn("reasoning_effort", params)
+
+    def test_rejected_reasoning_fields_can_be_dropped_for_a_retry(self):
+        params = self._params("high", self.OFFICIAL)
+        error = "Error code: 400 - Unrecognized request argument: thinking"
+
+        self.assertTrue(T._rejected_reasoning_params(error, params))
+        T._strip_reasoning_params(params)
+        self.assertNotIn("extra_body", params)
+        self.assertNotIn("reasoning_effort", params)
+        # The answer budget must stay large enough once reasoning is gone.
+        self.assertGreaterEqual(params["max_tokens"], T.MAX_TRANSLATION_OUTPUT_TOKENS)
+
+        # Unrelated 400s and plain requests must not be retried this way.
+        self.assertFalse(
+            T._rejected_reasoning_params("Error code: 400 - bad response_format", params)
+        )
+        self.assertFalse(T._rejected_reasoning_params(error, {}))
+
+
+class PromptLanguageTests(unittest.TestCase):
+    def test_blanket_english_replacement_is_skipped_for_english_sources(self):
+        prompt = "Translate English text into Russian."
+        with mock.patch.dict(os.environ, {"source_language": "English"}):
+            self.assertEqual(T._apply_target_language(prompt, "Russian"), prompt)
+        with mock.patch.dict(os.environ, {"source_language": "Japanese"}):
+            self.assertEqual(
+                T._apply_target_language("Translate Japanese to English.", "Russian"),
+                "Translate Japanese to Russian.",
+            )
+
+    def test_recent_speakers_keep_their_glossary_entry_outside_the_batch(self):
+        vocab = "# Game Characters\nCaly (Cali) - Female; narrator\n"
+        config = T.TranslationConfig(
+            model="test", language="English", prompt="Translate.",
+            vocab=vocab, useSfxReference=False,
+        )
+        history = ["[Caly]: Previous line.", "plain line without a speaker"]
+        payload = '{"Line1": "Another line."}'
+
+        self.assertEqual(T._history_speaker_names(history), ("Caly",))
+        _system, without_history, _sfx, _user = T.createContextParts(
+            config, payload, "json", history
+        )
+        _system, with_history, _sfx, _user = T.createContextParts(
+            config, payload, "json", history,
+            speaker_names=T._history_speaker_names(history),
+        )
+
+        self.assertNotIn("Caly (Cali)", without_history)
+        self.assertIn("Caly (Cali) - Female", with_history)
+
+
 if __name__ == "__main__":
     unittest.main()

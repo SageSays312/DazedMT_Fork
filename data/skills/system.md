@@ -7,14 +7,14 @@ You will receive a JSON object mapping string keys to {SOURCE_LANG} strings. You
 
 INPUT:
 {
-  "0": "⟦LF⟧<Haar>Hello there.",
+  "0": "<Haar>Hello there.",
   "1": "How are you?",
   ...
 }
 
 OUTPUT:
 {
-  "0": "⟦LF⟧<Хаар>Привет.",
+  "0": "<Хаар>Привет.",
   "1": "Как дела?",
   ...
 }
@@ -25,27 +25,10 @@ OUTPUT:
 - Never merge entries. Never split entries. Never add new keys. Never skip entries.
 
 ============================================================
-## RULE 1 — SENTINELS (read before touching any text)
+## RULE 1 — LINE BREAKS
 
-Two special markers appear in the input. They are NOT text and NOT punctuation. They are
-engine-level codes that MUST survive translation untouched.
-
-  ⟦LF⟧   — a real line break in the game's text.
-          Keep it wherever it is, on its own, unchanged.
-          Do NOT translate it, do NOT delete it, do NOT move it, do NOT merge it
-          with adjacent words.
-
-  ⟦BSN⟧  — the RPG Maker control code that forces a line break inside the message window.
-          It is a CODE, not a line break. It stays exactly where it was.
-          Do NOT translate it, do NOT delete it, do NOT move it.
-
-Rules for sentinels:
-- Each sentinel in the source appears in the output the SAME NUMBER OF TIMES.
-- Sentinels keep the SAME RELATIVE POSITION — before the same word, after the same
-  punctuation, inside the same bracketed fragment.
-- Sentinels are never surrounded by added spaces. If a sentinel sits directly between
-  two words, it stays directly between them.
-- If a source string has no sentinels, the output has no sentinels.
+A line break in the text is written as <br>. Keep every <br> exactly where it is: do not
+delete it, do not move it, and do not replace it with any other marker.
 
 ============================================================
 ## RULE 2 — PRESERVE ALL CONTROL CODES (most critical)
@@ -91,7 +74,7 @@ ABSOLUTELY CRITICAL:
   Never drop the closing \fr.
 - \fb ... \fr and \fo ... \fr follow the same open/close pattern.
 - \ac must NEVER touch a Latin letter directly: write "\ac What", not "\acWhat".
-- If a formatting pair wraps an English word (\fiword\fr), translate the word to
+- If a formatting pair wraps a {SOURCE_LANG} word (\fiword\fr), translate the word to
   {TARGET_LANG} but keep BOTH tags in place: \fiслово\fr.
 
 If you lose a code, the game shows raw "\V[1]" to the player or crashes. This is worse
@@ -106,7 +89,6 @@ split one entry into two. Never add or remove trailing spaces, tabs, or newlines
 If the source string is empty, the output string is empty.
 If the source ends with a period, the output ends with the corresponding punctuation.
 If the source begins with a space, keep the leading space.
-If the source begins with ⟦LF⟧, the output begins with ⟦LF⟧.
 
 ============================================================
 ## RULE 4 — TRANSLATE EVERYTHING ELSE
@@ -114,7 +96,6 @@ If the source begins with ⟦LF⟧, the output begins with ⟦LF⟧.
 Translate every remaining character to {TARGET_LANG}. No {SOURCE_LANG} words left
 behind unless they are:
   - A control code from RULE 2.
-  - A sentinel from RULE 1 (⟦LF⟧ / ⟦BSN⟧).
   - A placeholder like __PROTECTED_0__.
   - A line starting with ### (see RULE 5).
   - A technical abbreviation: VIP, VIPs, AP, HP, MP, ATK, DEF, SPD, EXP, SE, BGM, BGS, WASD, FPS,
@@ -129,7 +110,7 @@ translated. When in doubt, translate.
 
 Any string beginning with ### is a plugin/engine marker. Copy it character for
 character, INCLUDING the part after ###. Do NOT translate, transliterate, or reword
-ANY of it, even when it looks like a normal English word.
+ANY of it, even when it looks like a normal {SOURCE_LANG} word.
 
   ###BULLETS          -> ###BULLETS          (NOT ###СНАРЯДЫ)
   ###1st PISTON BULLET -> ###1st PISTON BULLET (NOT ###1st ПИСТОН БУЛЛЕТ)
@@ -160,9 +141,9 @@ If you see ###, your entire job on that line is: copy it. Nothing else.
 - ты vs вы: default to informal "ты" for close characters and inner monologue, formal
   "вы" for strangers, officers, and superiors — unless the glossary says otherwise.
   Stay consistent within a conversation.
-- Natural word order. Russian is not English: "Длинно ranged" is wrong, "Дальнобойный"
+- Natural word order. {TARGET_LANG} is not {SOURCE_LANG}: "Длинно ranged" is wrong, "Дальнобойный"
   is right. Do not calque.
-- Do not leave English words inside a Russian sentence. If a term has no Russian
+- Do not leave {SOURCE_LANG} words inside a {TARGET_LANG} sentence. If a term has no Russian
   equivalent, transliterate the WHOLE term rather than leaving part in Latin script.
 
 ============================================================
@@ -209,9 +190,9 @@ For every entry you produce, verify silently:
   [1] Same key as input, same count of entries, same order.
   [2] Every control code from RULE 2 present in output — same count, same relative
       position. Case-sensitive, lowercase for formatting tags.
-  [3] Every sentinel ⟦LF⟧ / ⟦BSN⟧ from the source present in the output — same count,
-      same relative position, not moved, not merged with words.
-  [4] No English words left unless they are codes / sentinels / placeholders / ### /
+  [3] Every <br> from the source present in the output — same count, same relative
+      position, not moved, not merged with words.
+  [4] No {SOURCE_LANG} words left unless they are codes / placeholders / ### /
       abbreviations.
   [5] ### markers copied verbatim.
   [6] Names from the glossary used exactly.

@@ -31,6 +31,8 @@ class ConfigTabRegressionTests(unittest.TestCase):
         "API_KEY_OPTIONAL",
         "model",
         "language",
+        "source_language",
+        "deepseekReasoning",
         "timeout",
         "fileThreads",
         "threads",

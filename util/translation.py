@@ -347,8 +347,35 @@ def _estimate_static_token_count(static_system, model):
 
 # ===== Placeholder Protection System =====
 # Patterns to protect from translation (sound effects, control codes, etc.)
+# Codes written without a ``[...]`` parameter. The name is only unambiguous when
+# something other than a letter follows it: in ``\fbBold`` the ASCII word after
+# ``\fb`` would otherwise be absorbed into the protected code and never
+# translated. A known bare code is therefore matched as the longest listed
+# prefix of the letter run; any unlisted name keeps the whole run protected.
+# Extra names may be listed, one per line, in data/rpgm_bare_codes.txt.
+_DEFAULT_BARE_CODES = ("tmn", "mn", "vc", "CL", "G", "fb", "fi", "fr", "fo", "ac")
+
+
+def _bare_code_names():
+    names = set(_DEFAULT_BARE_CODES)
+    try:
+        from util.paths import DATA_DIR
+
+        extra = Path(DATA_DIR) / "rpgm_bare_codes.txt"
+        if extra.is_file():
+            for line in extra.read_text(encoding="utf-8").splitlines():
+                name = line.split("#", 1)[0].strip()
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                    names.add(name)
+    except Exception:
+        pass
+    return sorted(names, key=lambda name: (-len(name), name))
+
+
 _GENERAL_CONTROL_PATTERN = (
-    r'[\\]+(?:[A-Za-z_][A-Za-z0-9_]*(?:\[(?:[^\[\]]|\[[^\]]*\])*\])?'
+    r'[\\]+(?:[A-Za-z_][A-Za-z0-9_]*\[(?:[^\[\]]|\[[^\]]*\])*\]'
+    r'|(?:' + '|'.join(re.escape(name) for name in _bare_code_names()) + r')'
+    r'|[A-Za-z_][A-Za-z0-9_]*'
     r'|[{}.!|^><#$@,\-])'
 )
 _ORPHAN_BACKSLASH_PATTERN = r'[\\]+(?=[^\W\d_])'
@@ -384,6 +411,21 @@ def _escaped_orphan_backslash(code):
     if _ORPHAN_BACKSLASH_RE.fullmatch(value) and len(value) % 2:
         return value + "\\"
     return value
+
+
+def _has_translatable_source(text, lang_regex):
+    """True when ``text`` has source-language content worth sending to the model.
+
+    Latin-script sources match ``[A-Za-z]+`` almost everywhere, including the
+    letters of control codes such as ``\\C[2]``. For those sources the codes are
+    ignored, so a line that is only codes is not requested (and not billed).
+    """
+    from util.source_lang import source_uses_broad_regex
+
+    sample = str(text)
+    if source_uses_broad_regex():
+        sample = _CONTROL_CODE_RE.sub("", sample)
+    return bool(re.search(lang_regex, sample))
 
 
 def extract_control_codes(text):
@@ -477,8 +519,13 @@ def validate_control_codes(original_items, translated_items, replacements_by_lin
         target_text, target_mapping_missing = _mask_mapped_control_codes(
             translated, replacements
         )
-        source_sequence = extract_control_codes(source_text)
-        target_sequence = extract_control_codes(target_text)
+        # Line breaks may be written as \n or <br>; only their placement is free.
+        source_sequence = [
+            code for code in extract_control_codes(source_text) if code != "\\n"
+        ]
+        target_sequence = [
+            code for code in extract_control_codes(target_text) if code != "\\n"
+        ]
 
         if source_mapping_missing:
             errors.append(
@@ -1587,6 +1634,17 @@ def _batch_entry_context_is_current(entry):
             version >= BATCH_CACHE_KEY_VERSION
             and _serialized_request_context_is_typed(entry.get("request_context"))
     )
+
+
+def _live_cache_profile(model, static_system, estimate=False):
+    """Fingerprint of everything besides the payload that shapes a live result."""
+    parts = (
+        str(model or ""),
+        str(static_system or ""),
+        os.getenv("deepseekReasoning", "off").strip().lower(),
+        "estimate" if estimate else "live",
+    )
+    return hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
 def get_cache_key(payload, language, cache_context=None, request_context=None):
@@ -4488,6 +4546,40 @@ def buildMatchedVocabText(vocabPairs, subbedText, history=None):
     return matchedVocabText
 
 
+def _apply_target_language(prompt, language):
+    """Retarget legacy prompts that name the target language literally.
+
+    Older prompts say "English" where they mean the target language. A prompt
+    rendered with ``{SOURCE_LANG}``/``{TARGET_LANG}`` already names both, and an
+    English source makes a blanket replacement ambiguous: "English text into
+    Russian" would become "Russian text into Russian".
+    """
+    from util.source_lang import get_source_language
+
+    if str(get_source_language()).strip().casefold() == "english":
+        return prompt
+    return prompt.replace("English", language)
+
+
+_SPEAKER_HISTORY_RE = re.compile(r'^\s*"?\[([^\]\r\n]{1,80})\]\s*[:|：]')
+
+
+def _history_speaker_names(history, limit=8):
+    """Distinct ``[Speaker]:`` tags from recent source-context lines, newest first."""
+    if not isinstance(history, list):
+        return ()
+    names = []
+    for item in reversed(history):
+        match = _SPEAKER_HISTORY_RE.match(str(item or ""))
+        if match:
+            name = match.group(1).strip()
+            if name and name not in names:
+                names.append(name)
+                if len(names) >= limit:
+                    break
+    return tuple(names)
+
+
 def createContextParts(config, subbedText, formatType, history=None, *, speaker_names=()):
     """Create separate glossary, SFX-reference, system, and user context.
 
@@ -4527,7 +4619,7 @@ def createContextParts(config, subbedText, formatType, history=None, *, speaker_
         enabled=bool(getattr(config, "useSfxReference", True)),
     )
 
-    static_system = config.prompt.replace("English", config.language)
+    static_system = _apply_target_language(config.prompt, config.language)
 
     if formatType == "json":
         user = f"```json\n{subbedText}\n```"
@@ -4808,6 +4900,61 @@ def buildClaudeRequest(system, user, history, formatType, model, numLines=None,
     return ant_kwargs
 
 
+def _deepseek_reasoning_mode():
+    """Configured DeepSeek reasoning: ``off`` (default), ``low`` or ``high``."""
+    value = os.getenv("deepseekReasoning", "off").strip().lower()
+    return value if value in ("off", "low", "high") else "off"
+
+
+_REASONING_REJECTION_MARKERS = (
+    "thinking",
+    "reasoning_effort",
+    "reasoning effort",
+)
+
+
+def _strip_reasoning_params(params):
+    """Drop the optional reasoning fields so a request can be retried without them."""
+    params.pop("reasoning_effort", None)
+    extra = dict(params.get("extra_body") or {})
+    extra.pop("thinking", None)
+    if extra:
+        params["extra_body"] = extra
+    else:
+        params.pop("extra_body", None)
+
+
+def _rejected_reasoning_params(error, params):
+    """True when a 400 says the provider does not accept our reasoning fields."""
+    if not (params.get("extra_body") or params.get("reasoning_effort")):
+        return False
+    text = str(error).lower()
+    return any(marker in text for marker in _REASONING_REJECTION_MARKERS)
+
+
+def _apply_deepseek_reasoning(params, api_url=None):
+    """Set DeepSeek's thinking mode, which the official API enables by default.
+
+    Reasoning tokens are billed as output and add latency to every request, so
+    translation keeps it off unless the user opts in. The field is sent only to
+    the official endpoint; other gateways may reject an unknown ``thinking`` key.
+    """
+    endpoint = os.getenv("api", "") if api_url is None else str(api_url or "")
+    if "deepseek.com" not in endpoint.lower():
+        return
+    mode = _deepseek_reasoning_mode()
+    extra = dict(params.get("extra_body") or {})
+    if mode == "off":
+        extra["thinking"] = {"type": "disabled"}
+    else:
+        extra["thinking"] = {"type": "enabled"}
+        params["reasoning_effort"] = mode
+        # Reasoning shares the completion budget with the answer.
+        key = "max_completion_tokens" if "max_completion_tokens" in params else "max_tokens"
+        params[key] = max(int(params.get(key) or 0), MAX_TRANSLATION_OUTPUT_TOKENS)
+    params["extra_body"] = extra
+
+
 def buildOpenAIRequest(system, user, history, penalty, formatType, model,
                        numLines=None, vocab_text="", api_provider=None,
                        context_kind=CONTEXT_SOURCE,
@@ -4889,6 +5036,8 @@ def buildOpenAIRequest(system, user, history, penalty, formatType, model,
                 },
             }
         )
+    if is_deepseek:
+        _apply_deepseek_reasoning(params, api_url)
     if provider == "gemini":
         params["temperature"] = 0
         thinking_budget_str = os.getenv("GEMINI_THINKING_BUDGET")
@@ -5116,6 +5265,14 @@ def translateText(system, user, history, penalty, formatType, model, numLines=No
             raise Exception(f"API endpoint not found (404) - check your API_PROVIDER and base URL settings. Error: {e}")
         elif e.status_code >= 500:
             raise Exception(f"API server error ({e.status_code}) - retrying... Error: {e}")
+        elif e.status_code == 400 and _rejected_reasoning_params(e, params):
+            # An endpoint or model that does not know the optional reasoning
+            # fields must still translate; retry once with a plain request.
+            _strip_reasoning_params(params)
+            try:
+                response = openai.chat.completions.create(**params)
+            except Exception as fallback_error:
+                raise Exception(f"API call failed: {e}. Fallback also failed: {fallback_error}")
         elif e.status_code == 400 and formatType == "json" and "json_schema" in str(responseFormat):
             # Only fall back to json_object if the error is NOT "Input should be 'json_schema'"
             # (that message means json_schema IS required and json_object would also be rejected)
@@ -5186,14 +5343,17 @@ def cleanTranslatedText(translatedText, language):
         # Note: 「 and 」 are NOT replaced here — replacing them with ASCII " would
         # corrupt raw JSON strings before extraction.  They are handled per-line
         # in _clean_extracted_line() after JSON parsing (when convertQuotes is on).
-        "—": "―",
         "】": "]",
         "【": "[",
-        "é": "e",
         "’": "'",
         "```json": "",
         "```": "",
     }
+    if str(language or "").strip().casefold() == "english":
+        # English-only typography: other targets keep their own dashes and
+        # accented letters (the em dash is the Russian dialogue dash).
+        placeholders["—"] = "―"
+        placeholders["é"] = "e"
 
     for target, replacement in placeholders.items():
         translatedText = translatedText.replace(target, replacement)
@@ -5532,6 +5692,184 @@ def last_translation_had_mismatch() -> bool:
     return bool(getattr(_thread_local, "last_translation_had_mismatch", False))
 
 
+def _translation_thread_count():
+    """Return how many requests for one file may run at the same time.
+
+    ``threads`` ("Threads per File") controls parallel batches inside a single
+    file; ``fileThreads`` keeps its separate meaning of parallel files.  The
+    value is clamped to the GUI range so a hand-edited ``.env`` cannot start an
+    unbounded number of provider requests.
+    """
+    raw = os.getenv("threads", "1")
+    try:
+        value = int(str(raw).strip() or "1")
+    except (TypeError, ValueError):
+        value = 1
+    return max(1, min(20, value))
+
+
+def _split_translation_batches(batches, count):
+    """Split contiguous batches into at most *count* balanced chunks."""
+    if count <= 1 or len(batches) <= 1:
+        return [list(batches)]
+    count = min(count, len(batches))
+    base, extra = divmod(len(batches), count)
+    chunks = []
+    start = 0
+    for index in range(count):
+        size = base + (1 if index < extra else 0)
+        chunks.append(batches[start:start + size])
+        start += size
+    return chunks
+
+
+def _translate_chunks_parallel(batches, initial_source,
+                               persistent_instructions, config, filename,
+                               pbar, lock, mismatchList, thread_count):
+    """Translate contiguous chunks of one file in parallel.
+
+    Each worker is an ordinary ``translateAI`` call for its own chunk, so cache
+    keys, validation, retries and per-batch cache writes stay unchanged.  Chunk
+    boundaries always fall on batch boundaries, which keeps every request
+    identical to the sequential path.  Only the request history differs: it is
+    the last batch of the previous chunk (the same preceding batch the
+    sequential loop would use).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    chunks = _split_translation_batches(batches, thread_count)
+    results = [None] * len(chunks)
+    tokens = [0, 0]
+    counters = {name: 0 for name in _FILE_COST_COUNTERS}
+    had_mismatch = False
+    cost_ready = False
+
+    def _translate_chunk(index):
+        chunk = chunks[index]
+        if index == 0:
+            history = initial_source
+        else:
+            previous = chunks[index - 1]
+            last_batch = previous[-1] if previous else []
+            history = (
+                list(last_batch[-config.maxHistory:])
+                if isinstance(last_batch, list)
+                else last_batch
+            )
+        flat = [item for batch in chunk for item in batch]
+        _thread_local.translation_chunk_worker = True
+        try:
+            # Workers report mismatches through the thread-local flag; the
+            # parent appends the filename once so parallel chunks cannot race.
+            result = translateAI(
+                flat,
+                history,
+                config,
+                filename=filename,
+                pbar=pbar,
+                lock=lock,
+                mismatchList=None,
+                request_instructions=persistent_instructions,
+            )
+            snapshot = {
+                name: int(getattr(_thread_local, name, 0) or 0)
+                for name in _FILE_COST_COUNTERS
+            }
+            return (
+                result,
+                snapshot,
+                bool(getattr(
+                    _thread_local, "last_translation_had_mismatch", False
+                )),
+                bool(getattr(_thread_local, "file_cost_ready", False)),
+            )
+        finally:
+            _thread_local.translation_chunk_worker = False
+
+    errors = []
+    with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
+        futures = [
+            executor.submit(_translate_chunk, index)
+            for index in range(len(chunks))
+        ]
+        for index, future in enumerate(futures):
+            try:
+                result, snapshot, mismatch, ready = future.result()
+            except Exception as exc:  # merge finished chunks before retrying
+                errors.append(exc)
+                continue
+            results[index] = result[0]
+            tokens[0] += int(result[1][0] or 0)
+            tokens[1] += int(result[1][1] or 0)
+            for name, value in snapshot.items():
+                counters[name] += value
+            had_mismatch = had_mismatch or mismatch
+            cost_ready = cost_ready or ready
+
+    # Worker threads have their own thread-local cost accumulators; fold their
+    # usage into this thread so calculateCost() sees the whole file.  The
+    # workers already added their call cost to _global_accurate_cost, so the
+    # parent must not finalize the same usage again (it returns right here).
+    for name, value in counters.items():
+        if value:
+            setattr(
+                _thread_local,
+                name,
+                int(getattr(_thread_local, name, 0) or 0) + value,
+            )
+    _thread_local.last_translation_had_mismatch = had_mismatch
+    _thread_local.file_cost_ready = cost_ready
+
+    if had_mismatch and filename and mismatchList is not None:
+        if filename not in mismatchList:
+            mismatchList.append(filename)
+
+    if errors:
+        raise errors[0]
+
+    translated = [item for chunk in results for item in chunk]
+    return [translated, tokens]
+
+
+def _translate_failed_batch_halves(items, history, config, filename, pbar, lock,
+                                   mismatchList, instructions):
+    """Translate a batch that failed validation as two smaller requests.
+
+    Each half runs the full pipeline again, so only the part that contains a bad
+    line is retried, and the other half keeps its valid translation. Recursion
+    ends at one line, which falls back to the original text as before.
+    """
+    middle = len(items) // 2
+    first, second = items[:middle], items[middle:]
+    second_history = (
+        list(first[-config.maxHistory:]) if config.maxHistory > 0 else []
+    )
+    translated = []
+    tokens = [0, 0]
+    # The parent call finalizes the cost of every request made on this thread,
+    # so the halves must not add their own cost to the global total as well.
+    previous = getattr(_thread_local, "suppress_cost_finalize", False)
+    _thread_local.suppress_cost_finalize = True
+    try:
+        for part, part_history in ((first, history), (second, second_history)):
+            part_result, part_tokens = translateAI(
+                part,
+                part_history,
+                config,
+                filename=filename,
+                pbar=pbar,
+                lock=lock,
+                mismatchList=mismatchList,
+                request_instructions=instructions,
+            )
+            translated.extend(part_result)
+            tokens[0] += int(part_tokens[0] or 0)
+            tokens[1] += int(part_tokens[1] or 0)
+    finally:
+        _thread_local.suppress_cost_finalize = previous
+    return translated, tokens
+
+
 def _retry_live_translation(func):
     """Retry live provider work, but never retry deterministic consume errors."""
     retried = retry(exceptions=Exception, tries=5, delay=5)(func)
@@ -5635,6 +5973,30 @@ def translateAI(text, history, config, filename=None, pbar=None, lock=None,
         list(item) if isinstance(item, list) else item for item in tList
     ]
 
+    # "Threads per File": run this file's batches as parallel requests. Only
+    # live translation benefits (batch collect/consume and Estimate must stay
+    # ordered), and nested chunk workers always translate sequentially.
+    thread_count = _translation_thread_count()
+    if (
+            isinstance(text, list)
+            and len(tList) > 1
+            and thread_count > 1
+            and batch_phase is None
+            and not config.estimateMode
+            and not getattr(_thread_local, "translation_chunk_worker", False)
+    ):
+        return _translate_chunks_parallel(
+            source_batches,
+            initial_source,
+            persistent_instructions,
+            config,
+            filename,
+            pbar,
+            lock,
+            mismatchList,
+            thread_count,
+        )
+
     for index, tItem in enumerate(tList):
         request_history = initial_source
         if isinstance(tItem, list):
@@ -5731,7 +6093,11 @@ def translateAI(text, history, config, filename=None, pbar=None, lock=None,
                 if j in corrupted_map:
                     continue
                 item_str = str(tItem[j]).strip() if tItem[j] else ""
-                if item_str and item_str != "Placeholder Text" and not re.search(config.langRegex, item_str):
+                if (
+                        item_str
+                        and item_str != "Placeholder Text"
+                        and not _has_translatable_source(item_str, config.langRegex)
+                ):
                     cleaned = cleanTranslatedText(tItem[j], config.language)
                     cleaned = convert_corner_brackets(cleaned, config.convertQuotes).strip()
                     no_japanese_map[j] = cleaned
@@ -5781,7 +6147,8 @@ def translateAI(text, history, config, filename=None, pbar=None, lock=None,
         # fingerprint is part of the lookup key, so results produced under an
         # older relevant spelling cannot bypass the current glossary.
         static_system, glossary_text, sfx_text, user = createContextParts(
-            config, subbedT, formatType, request_history
+            config, subbedT, formatType, request_history,
+            speaker_names=_history_speaker_names(request_history),
         )
         vocab_text = glossary_text + sfx_text
         # Live prompts may use a growing glossary during sequential consume.
@@ -5789,6 +6156,14 @@ def translateAI(text, history, config, filename=None, pbar=None, lock=None,
         key_context = _batch_stable_cache_context(
             subbedT, request_history, sfx_text, vocab_text
         )
+        if batch_phase is None:
+            # Live results depend on the model, the static prompt (including
+            # game overlays) and the reasoning mode; without them a changed
+            # setup would keep serving translations made under the old one.
+            key_context = (
+                f"{key_context}|profile:"
+                f"{_live_cache_profile(config.model, static_system, config.estimateMode)}"
+            )
 
         # Batch collect/estimate queues list payloads only. Single strings (speaker and
         # variable names) translate live — modules memoize them and embed the
@@ -6126,6 +6501,14 @@ def translateAI(text, history, config, filename=None, pbar=None, lock=None,
                 try:
                     entry = f"\n--- Batch ({len(clean_tItem) if isinstance(tItem, list) else 1} lines) ---\n"
                     entry += f"Prompt: {response.usage.prompt_tokens} tokens | Output: {response.usage.completion_tokens} tokens\n"
+                    _usage_info = _usage_to_debug_dict(response.usage)
+                    if "reasoning_tokens" in _usage_info:
+                        entry += f"Reasoning: {_usage_info['reasoning_tokens']} tokens (included in Output)\n"
+                    if "prompt_cache_hit_tokens" in _usage_info:
+                        entry += (
+                            f"Provider cache: hit={_usage_info['prompt_cache_hit_tokens']} "
+                            f"miss={_usage_info.get('prompt_cache_miss_tokens', 0)}\n"
+                        )
                     if hasattr(response.usage, "cache_read_input_tokens"):
                         cr = getattr(response.usage, "cache_read_input_tokens", 0) or 0
                         cw = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
@@ -6412,6 +6795,22 @@ def translateAI(text, history, config, filename=None, pbar=None, lock=None,
                     pbar.update(len(tItem) if isinstance(tItem, list) else 1)
 
         else:  # Validation fallback after all retries
+            if (
+                    isinstance(tItem, list)
+                    and len(tItem) > 1
+                    and batch_phase is None
+                    and not config.estimateMode
+            ):
+                # Retry only the half that holds the bad line; a valid half keeps
+                # its translation. The children already record their own cost.
+                halves, half_tokens = _translate_failed_batch_halves(
+                    tItem, request_history, config, filename, pbar, lock,
+                    mismatchList, persistent_instructions,
+                )
+                totalTokens[0] += half_tokens[0]
+                totalTokens[1] += half_tokens[1]
+                tList[index] = halves
+                continue
             _thread_local.last_translation_had_mismatch = True
             if pbar:
                 pbar.write(
@@ -6484,7 +6883,11 @@ def translateAI(text, history, config, filename=None, pbar=None, lock=None,
             getattr(_thread_local, 'file_batch_regular', 0) > _prev_breg
             or getattr(_thread_local, 'file_batch_output', 0) > _prev_bout
     )
-    if (_is_claude_final or _has_batch_delta) and not config.estimateMode:
+    if (
+            (_is_claude_final or _has_batch_delta)
+            and not config.estimateMode
+            and not getattr(_thread_local, "suppress_cost_finalize", False)
+    ):
         _pricing = getPricingConfig(config.model)
         _br = _pricing["inputAPICost"] / 1_000_000
         _or = _pricing["outputAPICost"] / 1_000_000

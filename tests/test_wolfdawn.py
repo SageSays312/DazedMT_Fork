@@ -17,12 +17,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from dotenv import load_dotenv
-
 ROOT = Path(__file__).resolve().parents[1]
 os.chdir(ROOT)
 sys.path.insert(0, str(ROOT))
-load_dotenv(ROOT / ".env", override=True)
 
 import modules.wolfdawn as wd  # noqa: E402
 

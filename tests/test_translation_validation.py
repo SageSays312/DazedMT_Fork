@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,6 +24,34 @@ class ControlCodeProtectionTests(unittest.TestCase):
         self.assertNotIn(r"\I[14]", protected)
         self.assertEqual(tr.restore_script_codes(protected, replacements), source)
 
+    def test_bare_format_codes_leave_the_following_word_translatable(self):
+        """``\\fbBold`` must not swallow ``Bold`` into the protected code."""
+        cases = (
+            (r"\fbBold\fr statement", "Bold", True),
+            (r"He said \fiold friend\fr twice.", "old friend", True),
+            (r"You got 50\Gcoins", "coins", True),
+            (r"\xyzPluginCode text", "PluginCode", False),  # unlisted names stay whole
+        )
+        for source, word, visible in cases:
+            with self.subTest(source=source):
+                protected, replacements = tr.protect_script_codes(source)
+                self.assertEqual(word in protected, visible)
+                self.assertEqual(tr.restore_script_codes(protected, replacements), source)
+
+        source = r"He said \fiold friend\fr twice."
+        _protected, replacements = tr.protect_script_codes(source)
+        valid, _reasons = tr.validate_control_codes(
+            source, "Он сказал старый друг\\fr дважды.", {0: replacements}
+        )
+        self.assertFalse(valid)
+
+    def test_code_only_lines_are_not_requested_for_latin_sources(self):
+        with mock.patch.dict(os.environ, {"source_language": "English"}):
+            self.assertFalse(tr._has_translatable_source(r"\C[2]\I[14]", r"[A-Za-z]+"))
+            self.assertTrue(tr._has_translatable_source(r"\C[2]Hello", r"[A-Za-z]+"))
+        with mock.patch.dict(os.environ, {"source_language": "Japanese"}):
+            self.assertTrue(tr._has_translatable_source(r"\C[2]こんにちは", r"[ぁ-ん]+"))
+
     def test_control_validation_cases(self):
         cases = (
             (
@@ -37,6 +67,27 @@ class ControlCodeProtectionTests(unittest.TestCase):
                 r"\I[14]a",
                 False,
                 (),
+            ),
+            (
+                "single slash changed to double",
+                r"\C[3]Name",
+                "\\\\C[3]Name",
+                False,
+                (r"\\C[3]",),
+            ),
+            (
+                "line break may change between \\n and <br>",
+                r"First\n second",
+                "First<br> second",
+                True,
+                (),
+            ),
+            (
+                "instant marker dropped",
+                r"\>Text",
+                "Text",
+                False,
+                (r"\>",),
             ),
             (
                 "complete scope moves with grammar",
@@ -147,6 +198,11 @@ class TranslationContentValidationTests(unittest.TestCase):
                 self.assertEqual(
                     tr.cleanTranslatedText(translated, "English"), translated
                 )
+
+    def test_cleanup_keeps_the_dialogue_dash_for_non_english_targets(self):
+        russian = "— Привет, друг!"
+        self.assertEqual(tr.cleanTranslatedText(russian, "Russian"), russian)
+        self.assertEqual(tr.cleanTranslatedText("Wait — what?", "English"), "Wait ― what?")
 
     def test_translation_content_validation_cases(self):
         language_regex = r"[\u3000一-龠ぁ-ゔァ-ヴー]+"
@@ -386,6 +442,62 @@ class EmptyProviderContentTests(unittest.TestCase):
             mismatch_log = (root / "mismatch.log").read_text(encoding="utf-8")
             self.assertIn("No translation content returned", mismatch_log)
             self.assertIn("finish_reason=content_filter", mismatch_log)
+
+    def test_failed_batch_retries_only_the_half_with_the_bad_line(self):
+        """One bad line must not send the whole batch back untranslated."""
+        source = [
+            "テスト一行目です。",
+            "テスト二行目です。",
+            "壊れた行です。",
+            "テスト四行目です。",
+        ]
+        english = {
+            "テスト一行目です。": "Line one.",
+            "テスト二行目です。": "Line two.",
+            "テスト四行目です。": "Line four.",
+        }
+
+        def translate(_system, user, _history, *_args, **_kwargs):
+            body = user.split("```json\n", 1)[1].rsplit("\n```", 1)[0]
+            payload = json.loads(body)
+            output = {
+                key: "" if "壊れた" in value else english[value]
+                for key, value in payload.items()
+            }
+            return tr._AnthropicCompat(json.dumps(output), 1, 1, 0, 0)
+
+        config = tr.TranslationConfig(
+            model="gpt-5",
+            language="English",
+            prompt="Translate Japanese to English.",
+            vocab="",
+            batchSize=4,
+            langRegex=r"[\u3040-\u30ff\u4e00-\u9fff]",
+            useSfxReference=False,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config.logFilePath = str(root / "translation.log")
+            config.mismatchLogPath = str(root / "mismatch.log")
+            mismatches = []
+            with (
+                mock.patch.object(tr, "get_batch_phase", return_value=None),
+                mock.patch.object(tr, "getBatchProvider", return_value=None),
+                mock.patch.object(tr, "get_cached_translation", return_value=None),
+                mock.patch.object(tr, "translateText", side_effect=translate),
+                mock.patch.object(tr, "cache_translation"),
+                mock.patch.object(tr, "save_cache"),
+                mock.patch("builtins.print"),
+            ):
+                result, _tokens = tr.translateAI(
+                    source, [], config, filename="Map002.json", mismatchList=mismatches
+                )
+
+        self.assertEqual(
+            result,
+            ["Line one.", "Line two.", "壊れた行です。", "Line four."],
+        )
+        self.assertEqual(mismatches, ["Map002.json"])
 
 
 class EstimateModeSafetyTests(unittest.TestCase):

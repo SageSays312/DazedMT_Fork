@@ -40,7 +40,7 @@ from util.paths import (
 )
 from util.rpgmaker_markers import SUPPORTED_CODE408_MARKERS
 from util.id_ranges import id_in_ranges
-from util.source_lang import get_lang_regex
+from util.source_lang import get_lang_regex, get_target_script_regex, source_uses_broad_regex
 
 # Globals
 MODEL = os.getenv("model")
@@ -246,7 +246,7 @@ FACENAME101_MAP = {
 # Pre-sorted by key length descending so longer prefixes match first.
 FACENAME101_MAP_SORTED = sorted(FACENAME101_MAP.items(), key=lambda x: len(x[0]), reverse=True)
 # BRFLAG: Newlines -> <br>.
-BRFLAG = False
+BRFLAG = True
 # FIXTEXTWRAP: Rewrap text to WIDTH/NOTEWIDTH.
 FIXTEXTWRAP = False
 # IGNORETLTEXT: Skip Translated Text.
@@ -931,7 +931,15 @@ def _text_needs_translation(current) -> bool:
     """Return whether a live value should be translated under the skip setting."""
     if current is None or not str(current).strip():
         return False
-    return not IGNORETLTEXT or _has_source_text(current)
+    if not IGNORETLTEXT:
+        return True
+    if source_uses_broad_regex():
+        # A Latin-script source cannot be told apart from its translation by
+        # letters alone; a target-script character marks the text as translated.
+        target_script = get_target_script_regex(TRANSLATION_CONFIG.language)
+        if target_script:
+            return not re.search(target_script, str(current))
+    return _has_source_text(current)
 
 
 _TARO_PLACEHOLDER_RE = re.compile(r"\bTaro(?:['’]s)?\b", re.IGNORECASE)
@@ -971,10 +979,11 @@ def _param_source(cmd, index: int) -> str:
 
 def _group_source(codeList, start: int, end: int) -> str:
     """Join source text for a merged 401/405 group (indices start..end inclusive)."""
-    if start < len(codeList):
-        orig = _scalar_original(codeList[start])
-        if orig is not None:
-            return orig
+    for index in (start, end):
+        if index < len(codeList):
+            orig = _scalar_original(codeList[index])
+            if orig is not None:
+                return orig
     parts = []
     for idx in range(start, end + 1):
         if idx >= len(codeList):
@@ -991,13 +1000,55 @@ def _group_source(codeList, start: int, end: int) -> str:
     return "\n".join(parts)
 
 
-def _group_raw_source(codeList, group_start: int, source_parts: list[str]) -> str:
-    """Batch source for merged 401/405; anchor _original wins on re-run."""
-    if group_start < len(codeList):
-        orig = _scalar_original(codeList[group_start])
-        if orig is not None:
-            return orig
+def _group_raw_source(codeList, group_start: int, source_parts: list[str], group_end: int | None = None) -> str:
+    """Batch source for merged 401/405; anchor _original wins on re-run.
+
+    The anchor is the first command of the group. Files translated by earlier
+    versions kept it on the last command, so that one is read as a fallback.
+    """
+    for index in (group_start, group_end):
+        if index is not None and 0 <= index < len(codeList):
+            orig = _scalar_original(codeList[index])
+            if orig is not None:
+                return orig
     return "\n".join(source_parts)
+
+
+def _assign_group_text(codeList, group_start: int, last: int, text: str, code: int) -> int:
+    """Write translated rows into a merged 401/405 group and return its new last index.
+
+    Rows fill the group's text commands in order. Extra rows become new commands
+    after the group. Source commands the translation no longer needs are emptied
+    (code -1, no parameters, the convention used for merged 408 and by rewrap), so
+    no source-language row survives next to the translation. An empty translation
+    leaves the group untouched.
+    """
+    lines = [line for line in text.split("\n") if line.strip()]
+    if not lines:
+        return last
+    slots = [
+        index for index in range(group_start, last + 1)
+        if codeList[index].get("code") in (401, 405, -1)
+    ]
+    used = min(len(slots), len(lines))
+    for slot, line in zip(slots, lines):
+        codeList[slot]["code"] = code
+        codeList[slot]["parameters"] = [line]
+    for slot in slots[used:]:
+        codeList[slot]["code"] = -1
+        codeList[slot]["parameters"] = []
+    for slot in slots:
+        if slot != group_start:
+            codeList[slot].pop("_original", None)
+    new_last = last
+    for line in lines[used:]:
+        new_item = copy.deepcopy(codeList[new_last])
+        new_item.pop("_original", None)
+        new_item["code"] = code
+        new_item["parameters"] = [line]
+        codeList.insert(new_last + 1, new_item)
+        new_last += 1
+    return new_last
 
 
 def _group_current(codeList, start: int, end: int) -> str:
@@ -1563,6 +1614,29 @@ _COLOR_SPEAKER_RE = re.compile(
 )
 
 
+_LINE_MARKER_RE = re.compile(r"\\(?:>|ac|CL|#)", re.IGNORECASE)
+
+
+def _line_marker_prefixes(text: str) -> list[str]:
+    """Return every ``\\>``, ``\\ac``, ``\\CL``, ``\\#`` of each source line, in order.
+
+    The writer removes these markers before translation and puts them back at
+    the start of the matching translated line, so each line keeps its own codes.
+    Copying one line's marker onto every line changes the codes.
+    """
+    return [
+        "".join(match.group(0) for match in _LINE_MARKER_RE.finditer(line))
+        for line in str(text).split("\n")
+    ]
+
+
+def _restore_line_marker(marker: str) -> str:
+    """Re-add a marker; a trailing space keeps a following letter from joining the code."""
+    if not marker:
+        return ""
+    return marker + " " if marker[-1].isalpha() else marker
+
+
 def _replace_speaker_in_param(param_str: str, source_name: str, translated_name: str) -> str:
     """Replace a speaker name inside a 401/101 parameter while keeping colour/bracket wrappers."""
     if not param_str or not translated_name:
@@ -1572,7 +1646,12 @@ def _replace_speaker_in_param(param_str: str, source_name: str, translated_name:
         return param_str.replace(m.group(1), translated_name, 1)
     bracket_disp = re.findall(r"【(.+?)】", param_str)
     if bracket_disp:
-        return param_str.replace(bracket_disp[0], translated_name, 1)
+        inner = bracket_disp[0]
+        if _COLOR_SPEAKER_RE.match(inner):
+            return param_str.replace(
+                inner, _replace_speaker_in_param(inner, source_name, translated_name), 1
+            )
+        return param_str.replace(inner, translated_name, 1)
     # Prefer the display name so trailing plugin codes like \F[tt07] stay put.
     display = _speaker_display_name(source_name) if source_name else ""
     if display and display in param_str:
@@ -1833,6 +1912,7 @@ def parseMap(data, filename):
         totalTokens[0] += lbTokens[0]
         totalTokens[1] += lbTokens[1]
         
+        pageBatch = _PageBatch()
         for event in events:
             if event is not None:
                 # Normalize note to a safe string
@@ -1861,15 +1941,24 @@ def parseMap(data, filename):
                     if page is not None:
                         totalTokensPage = [0, 0]
                         try:
-                            totalTokensPage = searchCodes(page, pbar, [], filename)
+                            totalTokensPage = searchCodes(page, pbar, [], filename, pageBatch)
                             totalTokens[0] += totalTokensPage[0]
                             totalTokens[1] += totalTokensPage[1]
+                            if pageBatch.should_flush():
+                                error = _flush_page_batch(pageBatch, data, filename, totalTokens)
+                                if error is not None:
+                                    return [data, totalTokens, error]
                         except Exception as e:
                             traceback.print_exc()
+                            _flush_page_batch(pageBatch, data, filename, totalTokens)
                             return [data, totalTokens, e]
                         finally:
                             # Persist progress only if this page produced tokens
                             checkSave(data, filename, totalTokensPage)
+
+        error = _flush_page_batch(pageBatch, data, filename, totalTokens)
+        if error is not None:
+            return [data, totalTokens, error]
     return [data, totalTokens, None]
 
 
@@ -2029,19 +2118,29 @@ def parseCommonEvents(data, filename):
 
     with tqdm(total=totalLines, bar_format=BAR_FORMAT, position=POSITION, leave=LEAVE, desc=filename) as pbar:
         PBAR = pbar
+        pageBatch = _PageBatch()
         for page in data:
             if page is not None:
                 totalTokensPage = [0, 0]
                 try:
-                    totalTokensPage = searchCodes(page, pbar, [], filename)
+                    totalTokensPage = searchCodes(page, pbar, [], filename, pageBatch)
                     totalTokens[0] += totalTokensPage[0]
                     totalTokens[1] += totalTokensPage[1]
+                    if pageBatch.should_flush():
+                        error = _flush_page_batch(pageBatch, data, filename, totalTokens)
+                        if error is not None:
+                            return [data, totalTokens, error]
                 except Exception as e:
                     traceback.print_exc()
+                    _flush_page_batch(pageBatch, data, filename, totalTokens)
                     return [data, totalTokens, e]
                 finally:
                     # Persist progress only if this page produced tokens
                     checkSave(data, filename, totalTokensPage)
+
+        error = _flush_page_batch(pageBatch, data, filename, totalTokens)
+        if error is not None:
+            return [data, totalTokens, error]
     return [data, totalTokens, None]
 
 
@@ -2095,21 +2194,31 @@ def parseTroops(data, filename):
 
     with tqdm(total=totalLines, bar_format=BAR_FORMAT, position=POSITION, leave=LEAVE, desc=filename) as pbar:
         PBAR = pbar
+        pageBatch = _PageBatch()
         for troop in data:
             if troop is not None:
                 for page in troop["pages"]:
                     if page is not None:
                         totalTokensPage = [0, 0]
                         try:
-                            totalTokensPage = searchCodes(page, pbar, [], filename)
+                            totalTokensPage = searchCodes(page, pbar, [], filename, pageBatch)
                             totalTokens[0] += totalTokensPage[0]
                             totalTokens[1] += totalTokensPage[1]
+                            if pageBatch.should_flush():
+                                error = _flush_page_batch(pageBatch, data, filename, totalTokens)
+                                if error is not None:
+                                    return [data, totalTokens, error]
                         except Exception as e:
                             traceback.print_exc()
+                            _flush_page_batch(pageBatch, data, filename, totalTokens)
                             return [data, totalTokens, e]
                         finally:
                             # Persist progress only if this page produced tokens
                             checkSave(data, filename, totalTokensPage)
+
+        error = _flush_page_batch(pageBatch, data, filename, totalTokens)
+        if error is not None:
+            return [data, totalTokens, error]
     return [data, totalTokens, None]
 
 
@@ -2418,19 +2527,29 @@ def parseScenario(data, filename):
 
     with tqdm(total=totalLines, bar_format=BAR_FORMAT, position=POSITION, leave=LEAVE, desc=filename) as pbar:
         PBAR = pbar
+        pageBatch = _PageBatch()
         for page in data.items():
             if page[1] is not None:
                 totalTokensPage = [0, 0]
                 try:
-                    totalTokensPage = searchCodes(page[1], pbar, [], filename)
+                    totalTokensPage = searchCodes(page[1], pbar, [], filename, pageBatch)
                     totalTokens[0] += totalTokensPage[0]
                     totalTokens[1] += totalTokensPage[1]
+                    if pageBatch.should_flush():
+                        error = _flush_page_batch(pageBatch, data, filename, totalTokens)
+                        if error is not None:
+                            return [data, totalTokens, error]
                 except Exception as e:
                     traceback.print_exc()
+                    _flush_page_batch(pageBatch, data, filename, totalTokens)
                     return [data, totalTokens, e]
                 finally:
                     # Persist progress only if this page produced tokens
                     checkSave(data, filename, totalTokensPage)
+
+        error = _flush_page_batch(pageBatch, data, filename, totalTokens)
+        if error is not None:
+            return [data, totalTokens, error]
     return [data, totalTokens, None]
 
 
@@ -2908,7 +3027,62 @@ def searchNames(data, pbar, context, filename):
     return totalTokens
 
 
-def searchCodes(page, pbar, jobList, filename):
+class _PageBatch:
+    """Translate the dialogue of several pages of one file in shared batches.
+
+    ``searchCodes`` normally translates each page's dialogue on its own, which
+    sends a full prompt for a handful of lines. With a batch it only collects
+    (pass 1) and registers the page here; ``flush`` then translates the pages'
+    dialogue as one list, which ``translateAI`` splits by batch size and which
+    carries the preceding lines across page boundaries, and finally runs each
+    page's pass 2 in order.
+    """
+
+    def __init__(self):
+        self.pending = []
+
+    def add(self, lines, finish):
+        self.pending.append((lines, finish))
+
+    def pending_lines(self):
+        return sum(len(lines) for lines, _finish in self.pending)
+
+    def should_flush(self):
+        return self.pending_lines() >= max(int(BATCHSIZE) * 4, 100)
+
+    def flush(self, filename):
+        """Translate and apply every waiting page; returns the tokens used."""
+        pending, self.pending = self.pending, []
+        if not pending:
+            return [0, 0]
+        merged = [line for lines, _finish in pending for line in lines]
+        response = translateAI(merged, "")
+        translated = response[0]
+        if len(translated) != len(merged):
+            with LOCK:
+                if filename not in MISMATCH:
+                    MISMATCH.append(filename)
+        offset = 0
+        for lines, finish in pending:
+            finish(translated[offset:offset + len(lines)])
+            offset += len(lines)
+        return [response[1][0], response[1][1]]
+
+
+def _flush_page_batch(batch, data, filename, totalTokens):
+    """Finish the pages still waiting in ``batch``; returns an exception or ``None``."""
+    try:
+        tokens = batch.flush(filename)
+    except Exception as e:
+        traceback.print_exc()
+        return e
+    totalTokens[0] += tokens[0]
+    totalTokens[1] += tokens[1]
+    checkSave(data, filename, tokens)
+    return None
+
+
+def searchCodes(page, pbar, jobList, filename, batch=None):
     if len(jobList) > 0:
         list401 = jobList[0]
         list122 = jobList[1]
@@ -3271,7 +3445,7 @@ def searchCodes(page, pbar, jobList, filename):
 
                 # Format String
                 if len(currentGroup) > 0:
-                    rawSource = _group_raw_source(codeList, groupStart, sourceGroup)
+                    rawSource = _group_raw_source(codeList, groupStart, sourceGroup, i)
                     currentSource = "\n".join(currentSourceGroup)
                     # Skip status is based on the live text, not preserved Japanese source.
                     if not rawSource.strip() or not _text_needs_translation(currentSource):
@@ -3345,6 +3519,8 @@ def searchCodes(page, pbar, jobList, filename):
                         finalJAString = finalJAString.replace(ffMatch.group(1), "")
                         nametag += ffMatch.group(1)
 
+                    line_markers = _line_marker_prefixes(finalJAString)
+
                     # Strip center markers from model input, then restore \ac in a
                     # delimiter-safe form after translation and wrapping.
                     if centerLineFlag:
@@ -3404,7 +3580,7 @@ def searchCodes(page, pbar, jobList, filename):
                     else:
                         # Grab Translated String
                         if len(list401) > 0:
-                            rawSource = _group_raw_source(codeList, groupStart, sourceGroup)
+                            rawSource = _group_raw_source(codeList, groupStart, sourceGroup, j)
                             translatedText = list401[0]
 
                             # Remove speaker prefix if present
@@ -3422,8 +3598,10 @@ def searchCodes(page, pbar, jobList, filename):
                             # Matches the whole code run at once so no intra-run spaces are added.
                             translatedText = re.sub(r'([^\s\\])((?:\\[.!|^])+)', r'\1 \2', translatedText)
 
-                            # Fix '- '
-                            translatedText = translatedText.replace("- ", "-")
+                            # Fix '- ' (English output only: elsewhere a spaced hyphen
+                            # is a dash, e.g. Russian "Он - герой")
+                            if str(TRANSLATION_CONFIG.language).casefold() == "english":
+                                translatedText = translatedText.replace("- ", "-")
 
                             # Textwrap
                             if FIXTEXTWRAP is True:
@@ -3444,16 +3622,19 @@ def searchCodes(page, pbar, jobList, filename):
                             # RPG Maker greedily reads Latin letters after a bare
                             # escape, so `\\acWhat` becomes one unknown code. Keep
                             # every translated display line centered with `\\ac `.
-                            if centerLineFlag:
+                            # Each line gets back its own source markers. If the
+                            # line count changed, keep every marker on the first
+                            # line so the code counts still match.
+                            translated_lines = translatedText.split("\n")
+                            if len(translated_lines) == len(line_markers):
                                 translatedText = "\n".join(
-                                    f"\\ac {line}" if line.strip() else line
-                                    for line in translatedText.split("\n")
+                                    _restore_line_marker(marker) + line
+                                    for marker, line in zip(line_markers, translated_lines)
                                 )
-
-                            # Formatting Code
-                            if instantLineFlag:
-                                translatedText = translatedText.replace("\n", "\n\\>")
-                                translatedText = f"\\>{translatedText}"
+                            elif any(line_markers):
+                                leading = "".join(dict.fromkeys(m for m in line_markers if m))
+                                translated_lines[0] = _restore_line_marker(leading) + translated_lines[0]
+                                translatedText = "\n".join(translated_lines)
 
                             # BR Flag
                             if BRFLAG is True:
@@ -3476,62 +3657,22 @@ def searchCodes(page, pbar, jobList, filename):
                             # Set Code
                             codeList[j]["code"] = code
 
-                            # Handle 405
-                            if codeList[j]["code"] == 405:
-                                # 1. Split translatedText by newlines
-                                lines = [line for line in translatedText.split('\n') if line.strip() != ""]
-                                
-                                # 2. Set the first string to codeList[j]["parameters"]
-                                codeList[j]["parameters"] = [lines[0]]
-                                
-                                # 3. Make copies for each additional line and insert them
-                                for idx, line in enumerate(lines[1:]):
-                                    new_item = copy.deepcopy(codeList[j])
-                                    new_item.pop("_original", None)
-                                    new_item["parameters"] = [line]
-                                    codeList.insert(j + idx + 1, new_item)
-                                
-                                # 4. Update syncIndex to the last modified/added position
-                                syncIndex = j + len(lines)
+                            # Handle 405 (scrolling text: one command per row) and
+                            # merged 401 groups: spread the translated rows over the
+                            # group so no source row is left behind.
+                            if codeList[j]["code"] == 405 or groupStart != j:
+                                j = _assign_group_text(
+                                    codeList, groupStart, j, translatedText, code
+                                )
+                                syncIndex = j + 1
 
-                            # Handle 401
+                            # Handle a single 401
                             else:
-                                # Если было склеено несколько 401 — раздаём строки перевода обратно
-                                if groupStart != j:
-                                    tl_lines = [ln for ln in translatedText.split("\n") if ln.strip()]
-                                    src_count = sum(
-                                        1 for k in range(groupStart, j + 1)
-                                        if codeList[k].get("code") in (401, 405, -1)
-                                    )
-                                    # Восстанавливаем промежуточные 401, которые join-цикл обнулил
-                                    idx = groupStart
-                                    used = 0
-                                    for line in tl_lines:
-                                        if idx > j:
-                                            break
-                                        # Пропускаем уже обработанные не-401 (например, 405)
-                                        while idx <= j and codeList[idx].get("code") not in (401, 405, -1):
-                                            idx += 1
-                                        if idx > j:
-                                            break
-                                        codeList[idx]["code"] = code
-                                        codeList[idx]["parameters"] = [line]
-                                        idx += 1
-                                        used += 1
-                                    # Если строк перевода больше, чем исходных 401 — добавляем новые
-                                    for line in tl_lines[used:]:
-                                        new_item = copy.deepcopy(codeList[j])
-                                        new_item.pop("_original", None)
-                                        new_item["parameters"] = [line]
-                                        codeList.insert(j + 1, new_item)
-                                        j += 1
-                                    syncIndex = j + 1
-                                else:
-                                    codeList[j]["parameters"] = [translatedText]
-                                    codeList[j]["code"] = code
-                                    syncIndex = i + 1
+                                codeList[j]["parameters"] = [translatedText]
+                                codeList[j]["code"] = code
+                                syncIndex = i + 1
 
-                            _apply_original(codeList[j], rawSource)
+                            _apply_original(codeList[groupStart], rawSource)
 
                             # Reset
                             speaker = ""
@@ -4830,7 +4971,11 @@ def searchCodes(page, pbar, jobList, filename):
                         codeList[i]["parameters"][0] = translatedText
 
             ### Event Code: 102 Show Choice
-            if "code" in codeList[i] and codeList[i]["code"] == 102 and CODE102 is True:
+            # Choices are translated while collecting (pass 1), where the preceding
+            # dialogue is available as context. Repeating the request in pass 2
+            # had no context, missed the cache, was billed again and replaced the
+            # contextual translation.
+            if "code" in codeList[i] and codeList[i]["code"] == 102 and CODE102 is True and setData:
                 choiceList = []
                 conditionList = []
                 choiceIndexMap = []  # Track which original indices we're processing
@@ -5055,15 +5200,20 @@ def searchCodes(page, pbar, jobList, filename):
         PBAR = pbar
 
         # 401
+        deferred401 = False
         if len(list401) > 0:
-            response = translateAI(list401, "")
-            list401TL = response[0]
-            totalTokens[0] += response[1][0]
-            totalTokens[1] += response[1][1]
-            if len(list401TL) != len(list401):
-                with LOCK:
-                    if filename not in MISMATCH:
-                        MISMATCH.append(filename)
+            if batch is not None and setData:
+                # Translated together with the file's other pages (see _PageBatch).
+                deferred401 = True
+            else:
+                response = translateAI(list401, "")
+                list401TL = response[0]
+                totalTokens[0] += response[1][0]
+                totalTokens[1] += response[1][1]
+                if len(list401TL) != len(list401):
+                    with LOCK:
+                        if filename not in MISMATCH:
+                            MISMATCH.append(filename)
 
         # 122
         if len(list122) > 0:
@@ -5190,26 +5340,35 @@ def searchCodes(page, pbar, jobList, filename):
             # Direct (non-batched) handlers can write during pass 1. Preserve
             # those sources before pass 2 so nested handlers can consult them.
             _apply_event_parameter_originals(parameterSourceSnapshots)
-            searchCodes(
-                page,
-                pbar,
-                [
-                    list401TL,
-                    list122TL,
-                    list355655TL,
-                    list108TL,
-                    list356TL,
-                    list357TL,
-                    list324TL,
-                    list408TL,
-                    list325TL,
-                    list657TL,
-                ],
-                filename,
-            )
-            # Batch handlers write during pass 2. Compare against the same
-            # pristine source snapshot so _original never captures a TL value.
-            _apply_event_parameter_originals(parameterSourceSnapshots)
+
+            def _pass2(dialogueTL):
+                searchCodes(
+                    page,
+                    pbar,
+                    [
+                        dialogueTL,
+                        list122TL,
+                        list355655TL,
+                        list108TL,
+                        list356TL,
+                        list357TL,
+                        list324TL,
+                        list408TL,
+                        list325TL,
+                        list657TL,
+                    ],
+                    filename,
+                )
+                # Batch handlers write during pass 2. Compare against the same
+                # pristine source snapshot so _original never captures a TL value.
+                _apply_event_parameter_originals(parameterSourceSnapshots)
+
+            if deferred401:
+                # Pass 2 and the -1 cleanup run from _PageBatch.flush; the page
+                # must stay exactly as pass 1 left it until then.
+                batch.add(list401, _pass2)
+                return totalTokens
+            _pass2(list401TL)
 
         # Delete all -1 codes
         codeListFinal = []
@@ -6671,6 +6830,9 @@ def finalizeSpeakerParse():
                 print(f"[finalize] skipped {len(invalid_log)} invalid pairs:")
                 for idx, o, t, n in invalid_log[:50]:
                     print(f"  [{idx}] {o!r} -> {t!r} (norm={n!r})")
+            if to_translate and not translated_pairs:
+                print("[finalize] FAIL: no valid speaker translation; glossary unchanged")
+                return False
 
             with _speakerCacheLock:
                 for orig, norm in translated_pairs:

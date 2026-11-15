@@ -36,12 +36,33 @@ def usage_to_dict(usage) -> dict:
         if value is not None:
             result[field] = value
 
+    details = getattr(usage, "completion_tokens_details", None)
+    reasoning = (
+        details.get("reasoning_tokens")
+        if isinstance(details, dict)
+        else getattr(details, "reasoning_tokens", None)
+    )
+    if reasoning is not None:
+        result["reasoning_tokens"] = reasoning
+
     extra = getattr(usage, "model_extra", None)
     if isinstance(extra, dict):
-        for field in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+        for field in (
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "prompt_cache_hit_tokens",
+            "prompt_cache_miss_tokens",
+        ):
             value = extra.get(field)
             if value is not None and field not in result:
                 result[field] = value
+        extra_details = extra.get("completion_tokens_details")
+        if (
+            "reasoning_tokens" not in result
+            and isinstance(extra_details, dict)
+            and extra_details.get("reasoning_tokens") is not None
+        ):
+            result["reasoning_tokens"] = extra_details["reasoning_tokens"]
     return result
 
 

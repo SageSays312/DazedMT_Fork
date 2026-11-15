@@ -567,6 +567,7 @@ class TestMVMZSourceOriginal(unittest.TestCase):
             patch.object(mvmz, "WIDTH", 60),
             patch.object(mvmz, "FACEWIDTH", 50),
             patch.object(mvmz, "FACENAME101", True),
+            patch.object(mvmz, "FIXTEXTWRAP", True),
             patch.object(mvmz.dazedwrap, "wrapText", side_effect=capture_wrap),
         ):
             _run_search_codes(page)
@@ -593,6 +594,7 @@ class TestMVMZSourceOriginal(unittest.TestCase):
         with (
             patch.object(mvmz, "WIDTH", 60),
             patch.object(mvmz, "FACEWIDTH", 50),
+            patch.object(mvmz, "FIXTEXTWRAP", True),
             patch.object(mvmz.dazedwrap, "wrapText", side_effect=capture_wrap),
         ):
             _run_search_codes(page)
@@ -804,6 +806,24 @@ class TestMVMZSourceOriginal(unittest.TestCase):
             for item in items:
                 if isinstance(item, str):
                     self.assertNotIn(r"\ac", item)
+
+    def test_instant_marker_is_restored_per_source_line(self):
+        """``\\>``/``\\ac`` must return to their own source lines, not every line."""
+        self.assertEqual(
+            mvmz._line_marker_prefixes("\\>a\nb\n\\ac c\\CL"),
+            ["\\>", "", "\\ac\\CL"],
+        )
+        page = {
+            "list": [
+                {"code": 401, "indent": 0, "parameters": ["\\>\\C[8]First line.\n  second line."]},
+            ]
+        }
+
+        translated, _captured = _run_search_codes(page)
+        text = _find_commands(translated, 401)[0]["parameters"][0]
+
+        self.assertEqual(text.count("\\>"), 1)
+        self.assertTrue(text.startswith("\\>"))
 
     def test_rerun_uses_original_not_display_text(self):
         page1, captured1 = _run_search_codes(_load_map_excerpt())
@@ -1260,7 +1280,7 @@ class TestMVMZSourceOriginal(unittest.TestCase):
         }
         with patch.object(mvmz, "CODE408", True), patch.object(
             mvmz, "JOIN408", False
-        ):
+        ), patch.object(mvmz, "IGNORETLTEXT", True):
             self.assertEqual(
                 mvmz._code408_progress_units(skipped_page["list"]), 0
             )
@@ -1415,6 +1435,180 @@ class TestFixtureMapOriginal(unittest.TestCase):
         }
         page, _ = _run_search_codes(page, preserve_original=False)
         self.assertNotIn("_original", page["list"][0])
+
+
+class TestMergedGroupWriteBack(unittest.TestCase):
+    """Rows of a merged 401/405 group never leave source text next to the translation."""
+
+    @staticmethod
+    def _group(code, rows):
+        return [{"code": code, "indent": 0, "parameters": [row]} for row in rows]
+
+    def test_translated_rows_replace_every_source_command(self):
+        cases = (
+            ("fewer rows", 401, ["A", "B", "C", "D"], "t1\nt2\nt3", [401, 401, 401, -1], ["t1", "t2", "t3"]),
+            ("single row", 401, ["A", "B", "C"], "only", [401, -1, -1], ["only"]),
+            ("more rows", 401, ["A", "B"], "1\n2\n3\n4", [401, 401, 401, 401], ["1", "2", "3", "4"]),
+            ("scrolling text", 405, ["A", "B", "C"], "s1\ns2", [405, 405, -1], ["s1", "s2"]),
+        )
+        for name, code, rows, translated, codes, texts in cases:
+            with self.subTest(name):
+                commands = self._group(code, rows)
+                last = mvmz._assign_group_text(commands, 0, len(commands) - 1, translated, code)
+                self.assertEqual(last, len(commands) - 1)
+                self.assertEqual([c["code"] for c in commands], codes)
+                self.assertEqual(
+                    [c["parameters"][0] for c in commands if c["parameters"]], texts
+                )
+
+    def test_empty_translation_keeps_the_source_group(self):
+        commands = self._group(401, ["A", "B"])
+        mvmz._assign_group_text(commands, 0, 1, "", 401)
+        self.assertEqual([c["parameters"] for c in commands], [["A"], ["B"]])
+
+    def test_source_anchor_is_read_from_first_or_legacy_last_command(self):
+        translated = self._group(401, ["T-A", "T-B", "T-C"])
+        translated[0]["_original"] = "A\nB\nC"
+        self.assertEqual(mvmz._group_raw_source(translated, 0, ["x"], 2), "A\nB\nC")
+
+        legacy = self._group(401, ["T-A", "T-B", "T-C"])
+        legacy[2]["_original"] = "A\nB\nC"
+        self.assertEqual(mvmz._group_raw_source(legacy, 0, ["x"], 2), "A\nB\nC")
+        self.assertEqual(mvmz._group_raw_source(legacy, 0, ["x"]), "x")
+
+
+class TestPageBatching(unittest.TestCase):
+    """Dialogue of many pages shares requests; choices are paid for once."""
+
+    @staticmethod
+    def _page(*rows, choices=None):
+        commands = [{"code": 101, "indent": 0, "parameters": ["", 0, 0, 2]}]
+        commands += [{"code": 401, "indent": 0, "parameters": [row]} for row in rows]
+        if choices:
+            commands.append({"code": 102, "indent": 0, "parameters": [list(choices), 0, 0, 2, 0]})
+        commands.append({"code": 0, "indent": 0, "parameters": []})
+        return {"list": commands}
+
+    @staticmethod
+    def _dialogue(page):
+        return [c["parameters"][0] for c in page["list"] if c["code"] == 401]
+
+    def _run(self, calls, pages, batch=None, flush=False):
+        def translate(text, history, batch_flag=False):
+            calls.append((copy.deepcopy(text), copy.deepcopy(history)))
+            return [[f"T:{item}" for item in text], [3, 5]]
+
+        with ExitStack() as stack:
+            for name, value in (
+                ("translateAI", translate),
+                ("getSpeaker", _mock_speaker),
+                ("CODE101", True), ("CODE401", True), ("CODE102", True),
+                ("FIXTEXTWRAP", False), ("IGNORETLTEXT", False),
+                ("PRESERVEORIGINAL", False),
+            ):
+                stack.enter_context(patch.object(mvmz, name, value))
+            for page in pages:
+                mvmz.searchCodes(page, None, [], "Map.json", batch)
+            if flush:
+                return batch.flush("Map.json")
+        return None
+
+    def test_pages_are_translated_together_after_collection(self):
+        pages = [self._page("alpha"), self._page("beta"), self._page("gamma")]
+        calls = []
+        batch = mvmz._PageBatch()
+
+        self._run(calls, pages, batch)
+        self.assertEqual(calls, [])
+        self.assertEqual([self._dialogue(p) for p in pages], [["alpha"], ["beta"], ["gamma"]])
+
+        calls.clear()
+        tokens = self._run(calls, [], batch, flush=True)
+        self.assertEqual([text for text, _history in calls], [["alpha", "beta", "gamma"]])
+        self.assertEqual(tokens, [3, 5])
+        self.assertEqual(
+            [self._dialogue(p) for p in pages], [["T:alpha"], ["T:beta"], ["T:gamma"]]
+        )
+
+    def test_each_choice_is_requested_once_with_dialogue_context(self):
+        calls = []
+        page = self._page("Where to?", choices=("Town", "Forest"))
+
+        self._run(calls, [page])
+
+        self.assertEqual(
+            [text for text, _history in calls], [["Town", "Forest"], ["Where to?"]]
+        )
+        choices = next(c for c in page["list"] if c["code"] == 102)
+        self.assertEqual(choices["parameters"][0], ["T:Town", "T:Forest"])
+        self.assertIn("Where to?", str(calls[0][1]))
+
+    def test_parse_map_flushes_pending_pages_at_the_end(self):
+        """The file-level loop must actually flush; otherwise dialogue stays source."""
+        calls = []
+
+        def translate(text, history, batch_flag=False):
+            calls.append(copy.deepcopy(text))
+            if isinstance(text, list):
+                return [[f"T:{item}" for item in text], [1, 1]]
+            return [text, [1, 1]]
+
+        class Bar:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def update(self, *_args):
+                pass
+
+            def write(self, *_args, **_kwargs):
+                pass
+
+            def refresh(self):
+                pass
+
+        events = [
+            None,
+            {
+                "id": 1,
+                "name": "EV1",
+                "note": "",
+                "pages": [self._page("alpha"), self._page("beta")],
+            },
+            {
+                "id": 2,
+                "name": "EV2",
+                "note": "",
+                "pages": [self._page("gamma")],
+            },
+        ]
+
+        with ExitStack() as stack:
+            for name, value in (
+                ("translateAI", translate),
+                ("getSpeaker", _mock_speaker),
+                ("translateLBNames", lambda _events: [0, 0]),
+                ("checkSave", lambda *_args, **_kwargs: None),
+                ("tqdm", Bar),
+                ("CODE101", True), ("CODE401", True), ("CODE102", True),
+                ("FIXTEXTWRAP", False), ("IGNORETLTEXT", False),
+                ("PRESERVEORIGINAL", False),
+            ):
+                stack.enter_context(patch.object(mvmz, name, value))
+            data = {"displayName": "", "events": events}
+            result = mvmz.parseMap(data, "Events.json")
+
+        self.assertIsNone(result[2])
+        self.assertEqual(calls, [["alpha", "beta", "gamma"]])
+        self.assertEqual(
+            [self._dialogue(page) for event in events[1:] for page in event["pages"]],
+            [["T:alpha"], ["T:beta"], ["T:gamma"]],
+        )
 
 
 if __name__ == "__main__":
