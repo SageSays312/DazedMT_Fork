@@ -1,0 +1,65 @@
+[
+  {
+    "type": "group",
+    "title": "Definitely Read These"
+  },
+  {
+    "id": "welcome",
+    "title": "Start Here",
+    "file": "00-welcome.md"
+  },
+  {
+    "id": "ai-helper",
+    "title": "Set Up Your AI Helper",
+    "file": "02-ai-helper.md"
+  },
+  {
+    "id": "git-setup",
+    "title": "Set Up Git (Optional)",
+    "file": "01-git-setup.md"
+  },
+  {
+    "id": "examples",
+    "title": "Full Translation Example",
+    "file": "06-examples.md"
+  },
+  {
+    "type": "group",
+    "title": "Extra Information"
+  },
+  {
+    "id": "workflow-rpg",
+    "title": "RPG Maker Steps",
+    "file": "03-workflow-rpg.md"
+  },
+  {
+    "id": "workflow-wolf",
+    "title": "WOLF RPG Steps",
+    "file": "04-workflow-wolf.md"
+  },
+  {
+    "id": "common-words",
+    "title": "Common Words & Buttons",
+    "file": "07-common-words.md"
+  },
+  {
+    "id": "problems-resuming",
+    "title": "Problems & Continuing Later",
+    "file": "08-problems-resuming.md"
+  },
+  {
+    "id": "backups-recovery",
+    "title": "Backups & Recovery",
+    "file": "09-backups-recovery.md"
+  },
+  {
+    "id": "playtest-checklist",
+    "title": "Playtesting Checklist",
+    "file": "10-playtest-checklist.md"
+  },
+  {
+    "id": "other-tabs",
+    "title": "What Other Tabs Do",
+    "file": "05-other-tabs.md"
+  }
+]
