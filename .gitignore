@@ -64,3 +64,6 @@ util/wolfdawn/.wolf_version.json
 *.part
 .DS_Store
 Thumbs.db
+
+# IDE settings (local only)
+.idea/
