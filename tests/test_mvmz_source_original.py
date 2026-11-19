@@ -807,6 +807,69 @@ class TestMVMZSourceOriginal(unittest.TestCase):
                 if isinstance(item, str):
                     self.assertNotIn(r"\ac", item)
 
+    def test_fill_mode_resends_only_groups_that_lost_lines(self):
+        """Fill mode keeps complete translations and reopens the short ones."""
+        full = [
+            {"code": 401, "indent": 0, "parameters": ["Привет."], "_original": "Hi.\nThere."},
+            {"code": 401, "indent": 0, "parameters": ["Всем."]},
+        ]
+        short = [
+            {"code": 401, "indent": 0, "parameters": ["Одна строка."], "_original": "Only line.\nLost line."},
+        ]
+        separator = {"code": 0, "indent": 0, "parameters": []}
+        data = {"events": [{"id": 1, "pages": [{"list": full + [separator] + short}]}]}
+
+        mvmz._reopen_short_groups(data)
+
+        self.assertEqual([c["parameters"] for c in full], [["Привет."], ["Всем."]])
+        self.assertEqual(short[0]["parameters"], ["Only line.\nLost line."])
+
+    def test_fill_mode_restores_dialogue_brackets_only_when_counts_match(self):
+        matched = [
+            {"code": 401, "indent": 0, "parameters": ["Он сказал «Да»."], "_original": "He said 「Yes」."},
+        ]
+        unmatched = [
+            {"code": 401, "indent": 0, "parameters": ["«Да» и «Нет»."], "_original": "「Yes」 and 「No」 and 「Maybe」."},
+        ]
+        separator = {"code": 0, "indent": 0, "parameters": []}
+        data = {"events": [{"id": 1, "pages": [{"list": matched + [separator] + unmatched}]}]}
+
+        mvmz._reopen_short_groups(data)
+
+        self.assertEqual(matched[0]["parameters"], ["Он сказал 「Да」."])
+        self.assertEqual(unmatched[0]["parameters"], ["«Да» и «Нет»."])
+
+    def test_open_files_dispatches_every_type_in_both_modes(self):
+        """Each file type must reach its parser, with or without fill mode."""
+        with TemporaryDirectory() as tmp:
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                os.makedirs("files")
+                os.makedirs("translated")
+                for folder in ("files", "translated"):
+                    Path(folder, "Actors.json").write_text('[null, {"name": "x"}]', encoding="utf-8")
+                with patch.object(mvmz, "parseNames", return_value=("parsed",)) as parse:
+                    self.assertEqual(mvmz.openFiles("Actors.json"), ("parsed",))
+                    with patch.object(mvmz, "FILL_MISSING", True):
+                        self.assertEqual(mvmz.openFiles("Actors.json"), ("parsed",))
+                self.assertEqual(parse.call_count, 2)
+            finally:
+                os.chdir(cwd)
+
+    def test_translated_newlines_become_separate_message_rows(self):
+        """A row must not carry a newline inside it; each line gets its own 401."""
+        page = {"list": [{"code": 401, "indent": 0, "parameters": ["テスト一行目です。"]}]}
+
+        def two_lines(text, history, batch=False):
+            value = "EN_LINE_A\nEN_LINE_B"
+            return [[value], [0, 0]] if isinstance(text, list) else [value, [0, 0]]
+
+        out, _captured = _run_search_codes(page, translate_fn=two_lines)
+        rows = [cmd["parameters"][0] for cmd in _find_commands(out, 401)]
+
+        self.assertEqual(rows, ["EN_LINE_A", "EN_LINE_B"])
+
     def test_instant_marker_is_restored_per_source_line(self):
         """``\\>``/``\\ac`` must return to their own source lines, not every line."""
         self.assertEqual(

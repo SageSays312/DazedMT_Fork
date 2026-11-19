@@ -353,7 +353,7 @@ def _estimate_static_token_count(static_system, model):
 # translated. A known bare code is therefore matched as the longest listed
 # prefix of the letter run; any unlisted name keeps the whole run protected.
 # Extra names may be listed, one per line, in data/rpgm_bare_codes.txt.
-_DEFAULT_BARE_CODES = ("tmn", "mn", "vc", "CL", "G", "fb", "fi", "fr", "fo", "ac")
+_DEFAULT_BARE_CODES = ("tmn", "mn", "vc", "CL", "G", "fb", "fi", "fr", "fo", "ac", "li")
 
 
 def _bare_code_names():
@@ -399,6 +399,11 @@ PROTECTED_PATTERNS = [
     # ``\Helen``). Protect the slash run separately; target restoration escapes
     # odd runs so they remain literal instead of becoming runtime commands.
     _ORPHAN_BACKSLASH_PATTERN,
+    # Dialogue brackets must come back as the same characters, not « » or quotes.
+    r'[「」]',
+    # Each line break is its own placeholder, so the model cannot merge or drop
+    # a line without losing a placeholder (which the validator rejects).
+    r'\n',
 ]
 
 _CONTROL_CODE_RE = re.compile(_GENERAL_CONTROL_PATTERN)
@@ -411,6 +416,14 @@ def _escaped_orphan_backslash(code):
     if _ORPHAN_BACKSLASH_RE.fullmatch(value) and len(value) % 2:
         return value + "\\"
     return value
+
+
+_PLACEHOLDER_TOKEN_RE = re.compile(r"__PROTECTED_\d+__")
+
+
+def _placeholder_only(text):
+    """True when a protected line holds nothing but placeholders and whitespace."""
+    return not _PLACEHOLDER_TOKEN_RE.sub("", str(text or "")).strip()
 
 
 def _has_translatable_source(text, lang_regex):
@@ -6073,6 +6086,12 @@ def translateAI(text, history, config, filename=None, pbar=None, lock=None,
                 collapsed = re.sub(r'(.)\1{9,}', lambda m: m.group(1) * 10, tItem)
                 protected_items, all_replacements[0] = protect_script_codes(collapsed)
 
+        if not isinstance(tItem, list) and _placeholder_only(protected_items):
+            tList[index] = tItem
+            if pbar is not None:
+                pbar.update(1)
+            continue
+
         # Filter out corrupted/mojibake text (U+FFFD) from the batch before API call
         corrupted_map = {}  # original_index -> original_text
         if isinstance(tItem, list):
@@ -6096,7 +6115,10 @@ def translateAI(text, history, config, filename=None, pbar=None, lock=None,
                 if (
                         item_str
                         and item_str != "Placeholder Text"
-                        and not _has_translatable_source(item_str, config.langRegex)
+                        and (
+                            not _has_translatable_source(item_str, config.langRegex)
+                            or _placeholder_only(protected_items[j])
+                        )
                 ):
                     cleaned = cleanTranslatedText(tItem[j], config.language)
                     cleaned = convert_corner_brackets(cleaned, config.convertQuotes).strip()

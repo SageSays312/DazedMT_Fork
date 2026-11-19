@@ -204,9 +204,9 @@ def refreshRuntimeConfig():
 
 # Config (Default)
 # FIRSTLINESPEAKERS: Guess speaker from first line.
-FIRSTLINESPEAKERS = True
+FIRSTLINESPEAKERS = False
 # INLINE401SPEAKERS: Extract speaker from "Name「dialogue」" inline format on 401 lines.
-INLINE401SPEAKERS = False
+INLINE401SPEAKERS = True
 # FACENAME101: Map face name -> speaker.
 FACENAME101 = False
 # Face name -> speaker mapping for FACENAME101.
@@ -246,7 +246,7 @@ FACENAME101_MAP = {
 # Pre-sorted by key length descending so longer prefixes match first.
 FACENAME101_MAP_SORTED = sorted(FACENAME101_MAP.items(), key=lambda x: len(x[0]), reverse=True)
 # BRFLAG: Newlines -> <br>.
-BRFLAG = True
+BRFLAG = False
 # FIXTEXTWRAP: Rewrap text to WIDTH/NOTEWIDTH.
 FIXTEXTWRAP = False
 # IGNORETLTEXT: Skip Translated Text.
@@ -267,7 +267,7 @@ CODE405 = True
 CODE102 = True
 
 # Optional
-CODE408 = True
+CODE408 = False
 # Code 408 continues an RPG Maker comment started by code 108. Only known
 # player-facing comment blocks should be sent for translation.
 
@@ -323,14 +323,7 @@ HEADER_MAPPINGS_357 = {
     "SceneGlossary": (["category"], None),
 }
 # Subset of HEADER_MAPPINGS_357 keys that should be processed (empty = none).
-ENABLED_PLUGINS_357: set = {
-    "DTextPicture",
-    "MM_UltimateTextAnimation",
-    "TextButtonPicture",
-    "TextPicture",
-    "TextPlacer",
-    "TorigoyaMZ_NotifyMessage",
-}
+ENABLED_PLUGINS_357: set = {"DTextPicture", "MM_UltimateTextAnimation", "TextButtonPicture", "TextPicture", "TextPlacer", "TorigoyaMZ_NotifyMessage"}
 
 # All known code-355/655 script patterns. Enable entries via ENABLED_PATTERNS_355655.
 PATTERNS_355655 = {
@@ -532,9 +525,79 @@ def handleMVMZ(filename, estimate):
         return totalString
 
 
+FILL_MISSING = os.getenv("translateMissingOnly", "false").strip().lower() in ("true", "1", "yes")
+
+
+def _restore_dialogue_brackets(original, commands, start, end):
+    """Put 「」 back where the translation replaced them with « ».
+
+    Only when the counts match the original group, so ordinary guillemets are
+    never rewritten by mistake.
+    """
+    if "「" not in original and "」" not in original:
+        return
+    rows = [commands[k].get("parameters") or [""] for k in range(start, end)]
+    text = "\n".join(row[0] for row in rows if isinstance(row[0], str))
+    if text.count("«") != original.count("「") or text.count("»") != original.count("」"):
+        return
+    for k in range(start, end):
+        value = commands[k].get("parameters") or [""]
+        if isinstance(value[0], str):
+            commands[k]["parameters"] = [value[0].replace("«", "「").replace("»", "」")]
+
+
+def _reopen_short_groups(data):
+    """In fill mode, send groups whose translation lost lines back to the model.
+
+    The translated file is the input. A message group whose translated line count
+    differs from its recorded original is set back to the original text, so it
+    is translated again; the other groups are kept because the skip setting
+    treats text in the target script as already translated.
+    """
+    if not isinstance(data, dict):
+        return
+    for event in data.get("events", []) or []:
+        if not event:
+            continue
+        for page in event.get("pages", []) or []:
+            commands = page.get("list", []) or []
+            index = 0
+            while index < len(commands):
+                command = commands[index]
+                if not command or command.get("code") != 401:
+                    index += 1
+                    continue
+                end = index
+                while end < len(commands) and commands[end] and commands[end].get("code") == 401:
+                    end += 1
+                original = command.get("_original")
+                if isinstance(original, str) and original.strip():
+                    source_lines = [line for line in original.split("\n") if line.strip()]
+                    rows = [
+                        (commands[k].get("parameters") or [""])[0]
+                        for k in range(index, end)
+                    ]
+                    kept_lines = [
+                        line for row in rows if isinstance(row, str)
+                        for line in row.split("\n") if line.strip()
+                    ]
+                    if len(kept_lines) != len(source_lines):
+                        for k in range(index, end):
+                            commands[k]["parameters"] = [original if k == index else ""]
+                    else:
+                        _restore_dialogue_brackets(original, commands, index, end)
+                index = end
+
+
 def openFiles(filename):
-    with open("files/" + filename, "r", encoding="utf-8-sig") as f:
+    global IGNORETLTEXT
+    existing = os.path.join("translated", filename)
+    source_path = existing if FILL_MISSING and os.path.isfile(existing) else "files/" + filename
+    with open(source_path, "r", encoding="utf-8-sig") as f:
         data = json.load(f)
+        if FILL_MISSING and source_path == existing:
+            IGNORETLTEXT = True
+            _reopen_short_groups(data)
 
         # Map Files
         if "Map" in filename and "MapInfos" not in filename:
@@ -3660,7 +3723,7 @@ def searchCodes(page, pbar, jobList, filename, batch=None):
                             # Handle 405 (scrolling text: one command per row) and
                             # merged 401 groups: spread the translated rows over the
                             # group so no source row is left behind.
-                            if codeList[j]["code"] == 405 or groupStart != j:
+                            if codeList[j]["code"] == 405 or groupStart != j or "\n" in translatedText:
                                 j = _assign_group_text(
                                     codeList, groupStart, j, translatedText, code
                                 )
@@ -5901,8 +5964,11 @@ def _normalize_speaker_nameplate(translated: str) -> str:
     out = re.sub(r"^(speaker:\s*)", "", out, flags=re.IGNORECASE)
     out = out.strip("'\"“”‘’「」")
     # If the model ignored instructions and wrote a sentence, keep the lead clause.
-    if re.search(r"[.!?]", out):
-        out = re.split(r"[.!?]", out, maxsplit=1)[0].strip()
+    # Only a sentence end after a real word counts; "??? Bella ???" keeps its
+    # question-mark wrapper instead of being cut down to nothing.
+    sentence_end = re.search(r"(?<=[^\W\d_][^\W\d_])[.!?]", out)
+    if sentence_end:
+        out = out[:sentence_end.start()].strip()
     # Drop trailing commas / "the kind you'd..." style appositives.
     if "," in out:
         out = out.split(",", 1)[0].strip()

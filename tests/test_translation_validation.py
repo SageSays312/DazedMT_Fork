@@ -443,6 +443,25 @@ class EmptyProviderContentTests(unittest.TestCase):
             self.assertIn("No translation content returned", mismatch_log)
             self.assertIn("finish_reason=content_filter", mismatch_log)
 
+    def test_bare_li_code_does_not_absorb_the_following_word(self):
+        protected, _replacements = tr.protect_script_codes(r"\liWait for it")
+
+        self.assertEqual(protected, "__PROTECTED_0__Wait for it")
+
+    def test_placeholder_only_lines_are_not_sent_to_the_model(self):
+        """A protected line that is only placeholders has nothing to translate."""
+        self.assertTrue(tr._placeholder_only("__PROTECTED_0__ __PROTECTED_1__\n"))
+        self.assertFalse(tr._placeholder_only("__PROTECTED_0__Hi__PROTECTED_1__"))
+
+    def test_line_breaks_and_dialogue_brackets_round_trip_through_placeholders(self):
+        """Newlines and 「」 are sent as placeholders and restored unchanged."""
+        source = "…The door.\n「Will open」\nis written."
+        protected, replacements = tr.protect_script_codes(source)
+
+        self.assertNotIn("\n", protected)
+        self.assertNotIn("「", protected)
+        self.assertEqual(tr.restore_script_codes(protected, replacements), source)
+
     def test_failed_batch_retries_only_the_half_with_the_bad_line(self):
         """One bad line must not send the whole batch back untranslated."""
         source = [

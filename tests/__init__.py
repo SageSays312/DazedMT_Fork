@@ -19,3 +19,4 @@ prepare()
 # changing expected results.
 os.environ["source_language"] = "Japanese"
 os.environ["language"] = "English"
+os.environ["deepseekReasoning"] = "off"

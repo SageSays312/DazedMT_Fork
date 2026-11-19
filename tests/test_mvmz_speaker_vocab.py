@@ -707,6 +707,10 @@ class MVMZSpeakerVocabTests(unittest.TestCase):
 
 
 class CharacterCompoundMatchingTests(unittest.TestCase):
+    def tearDown(self):
+        mvmz.SPEAKER_PARSE_MODE = False
+        mvmz.resetSpeakerState()
+
     def test_slash_alias_row_matches_dialogue_and_suppresses_short_duplicate(self):
         pairs = parseVocabWithCategories(
             "# Game Characters\n"
